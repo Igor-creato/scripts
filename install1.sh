@@ -123,6 +123,7 @@ entryPoints:
 providers:
   docker:
     exposedByDefault: false
+    network: traefik-net
 certificatesResolvers:
   letsencrypt:
     acme:
@@ -165,9 +166,6 @@ services:
     command:
       - "--providers.docker=true"
       - "--providers.docker.exposedbydefault=false"
-      # --- КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ ---
-      # Явно указываем Traefik, какую сеть использовать для поиска контейнеров.
-      # Это решает проблему "unable to find the IP address".
       - "--providers.docker.network=traefik-net"
       - "--log.level=INFO"
       - "--entrypoints.web.address=:80"
@@ -216,6 +214,7 @@ services:
       - GENERIC_TIMEZONE=Europe/Amsterdam
       - N8N_HOST=$N8N_DOMAIN
       - N8N_PROTOCOL=https
+      - N8N_PORT=5678
     volumes:
       - ./n8n/data:/home/node/.n8n
     labels:
@@ -316,6 +315,7 @@ version: "3.9"
 networks:
   traefik-net:
     external: true
+
 services:
   kong:
     networks:
@@ -335,6 +335,34 @@ services:
       - "traefik.http.routers.supabase-studio.entrypoints=websecure"
       - "traefik.http.routers.supabase-studio.tls.certresolver=letsencrypt"
       - "traefik.http.services.supabase-studio.loadbalancer.server.port=3000"
+  # Ensure all other Supabase services are connected to traefik-net
+  auth:
+    networks:
+      - traefik-net
+  rest:
+    networks:
+      - traefik-net
+  realtime:
+    networks:
+      - traefik-net
+  storage:
+    networks:
+      - traefik-net
+  imgproxy:
+    networks:
+      - traefik-net
+  meta:
+    networks:
+      - traefik-net
+  db:
+    networks:
+      - traefik-net
+  functions:
+    networks:
+      - traefik-net
+  analytics:
+    networks:
+      - traefik-net
 EOF
 
 # ---------- ЗАПУСК TRAEFIK + SITE + N8N ----------
@@ -349,3 +377,7 @@ docker compose up -d
 
 echo "✅ Установка завершена!"
 echo "🌐 Traefik Dashboard: https://$TRAEFIK_DOMAIN"
+echo "🌐 n8n: https://$N8N_DOMAIN"
+echo "🌐 Supabase API: https://$SUPABASE_DOMAIN"
+echo "🌐 Supabase Studio: https://$STUDIO_DOMAIN"
+echo "🌐 Site: https://$SITE_DOMAIN"
