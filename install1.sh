@@ -204,9 +204,29 @@ else
   echo ".env для Supabase уже существует."
 fi
 
-# ---------- КОПИРОВАНИЕ И МОДИФИКАЦИЯ DOCKER-COMPOSE SUPABASE ----------
-echo "Копирую и модифицирую docker-compose.yml из Supabase..."
-cp "$SUPABASE_DIR/docker/docker-compose.yml" "$SUPABASE_DOCKER_DIR/docker-compose.yml"
+# ---------- ПОИСК И КОПИРОВАНИЕ КОНФИГОВ SUPABASE ----------
+echo "Ищу конфигурационные файлы Supabase..."
+
+# Ищем docker-compose.yml в различных местах
+SUPABASE_COMPOSE_SOURCE=""
+for possible_path in \
+  "$SUPABASE_DIR/docker/docker-compose.yml" \
+  "$SUPABASE_DIR/docker-compose.yml" \
+  "$SUPABASE_DIR/supabase/docker/docker-compose.yml" \
+  "$SUPABASE_DIR/apps/docker/docker-compose.yml"; do
+  if [ -f "$possible_path" ]; then
+    SUPABASE_COMPOSE_SOURCE="$possible_path"
+    echo "✅ Найден docker-compose.yml в: $possible_path"
+    break
+  fi
+done
+
+if [ -z "$SUPABASE_COMPOSE_SOURCE" ]; then
+  echo "⚠️  docker-compose.yml от Supabase не найден, используем встроенную конфигурацию"
+else
+  echo "📋 Копирую docker-compose.yml из Supabase..."
+  cp "$SUPABASE_COMPOSE_SOURCE" "$SUPABASE_DOCKER_DIR/docker-compose.yml"
+fi
 
 # ---------- ЕДИНЫЙ DOCKER-COMPOSE ДЛЯ ВСЕХ СЕРВИСОВ ----------
 echo "Создаю единый docker-compose.yml..."
@@ -682,14 +702,256 @@ mkdir -p "$PROJECT_DIR/volumes/storage"
 mkdir -p "$PROJECT_DIR/volumes/functions"
 mkdir -p "$PROJECT_DIR/volumes/logs"
 
-# Копируем SQL файлы инициализации
-if [ -f "$SUPABASE_DIR/docker/volumes/db/init/data.sql" ]; then
-  cp "$SUPABASE_DIR/docker/volumes/db/init/data.sql" "$PROJECT_DIR/volumes/db/"
+# Ищем и копируем SQL файлы инициализации
+echo "Ищу SQL файлы инициализации..."
+for sql_dir in \
+  "$SUPABASE_DIR/docker/volumes/db" \
+  "$SUPABASE_DIR/volumes/db" \
+  "$SUPABASE_DIR/supabase/docker/volumes/db"; do
+  if [ -d "$sql_dir" ]; then
+    echo "✅ Копирую SQL файлы из: $sql_dir"
+    cp -r "$sql_dir"/*.sql "$PROJECT_DIR/volumes/db/" 2>/dev/null || true
+    break
+  fi
+done
+
+# Ищем и копируем конфигурацию Kong
+echo "Ищу конфигурацию Kong..."
+for kong_config in \
+  "$SUPABASE_DIR/docker/volumes/api/kong.yml" \
+  "$SUPABASE_DIR/volumes/api/kong.yml" \
+  "$SUPABASE_DIR/supabase/docker/volumes/api/kong.yml"; do
+  if [ -f "$kong_config" ]; then
+    echo "✅ Копирую Kong конфигурацию из: $kong_config"
+    cp "$kong_config" "$PROJECT_DIR/volumes/api/"
+    break
+  fi
+done
+
+# Если конфигурации не найдены, создаем базовые
+if [ ! -f "$PROJECT_DIR/volumes/api/kong.yml" ]; then
+  echo "⚠️  Kong конфигурация не найдена, создаю базовую..."
+  cat > "$PROJECT_DIR/volumes/api/kong.yml" <<'KONG_EOF'
+_format_version: "1.1"
+
+consumers:
+  - username: anon
+    keyauth_credentials:
+      - key: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBsYWNlaG9sZGVyIiwicm9sZSI6ImFub24iLCJpYXQiOjE2NDUxOTI0MjUsImV4cCI6MTk2MDc2ODQyNX0.A9JRSHURnBRtrnZ4sI-9eU_igOpS-WPHm7dXyn7mwAE
+  - username: service_role
+    keyauth_credentials:
+      - key: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBsYWNlaG9sZGVyIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTY0NTE5MjQyNSwiZXhwIjoxOTYwNzY4NDI1fQ.M2d2z4SFn5C7HlJlaSLfrzuYim9nbY_XI40uWFN3hEE
+
+acls:
+  - consumer: anon
+    group: anon
+  - consumer: service_role
+    group: service_role
+
+services:
+  - name: auth-v1-open
+    url: http://auth:9999/verify
+    routes:
+      - name: auth-v1-open
+        strip_path: true
+        paths:
+          - "/auth/v1/verify"
+    plugins:
+      - name: cors
+
+  - name: auth-v1-open-callback
+    url: http://auth:9999/callback
+    routes:
+      - name: auth-v1-open-callback
+        strip_path: true
+        paths:
+          - "/auth/v1/callback"
+    plugins:
+      - name: cors
+
+  - name: auth-v1-open-authorize
+    url: http://auth:9999/authorize
+    routes:
+      - name: auth-v1-open-authorize
+        strip_path: true
+        paths:
+          - "/auth/v1/authorize"
+    plugins:
+      - name: cors
+
+  - name: auth-v1
+    _comment: "GoTrue: /auth/v1/* -> http://auth:9999/*"
+    url: http://auth:9999/
+    routes:
+      - name: auth-v1-all
+        strip_path: true
+        paths:
+          - "/auth/v1/"
+    plugins:
+      - name: cors
+
+  - name: rest-v1
+    _comment: "PostgREST: /rest/v1/* -> http://rest:3000/*"
+    url: http://rest:3000/
+    routes:
+      - name: rest-v1-all
+        strip_path: true
+        paths:
+          - "/rest/v1/"
+    plugins:
+      - name: cors
+      - name: key-auth
+        config:
+          hide_credentials: false
+
+  - name: realtime-v1
+    _comment: "Realtime: /realtime/v1/* -> ws://realtime:4000/socket/*"
+    url: http://realtime:4000/socket/
+    routes:
+      - name: realtime-v1-all
+        strip_path: true
+        paths:
+          - "/realtime/v1/"
+    plugins:
+      - name: cors
+      - name: key-auth
+        config:
+          hide_credentials: false
+
+  - name: storage-v1
+    _comment: "Storage: /storage/v1/* -> http://storage:5000/*"
+    url: http://storage:5000/
+    routes:
+      - name: storage-v1-all
+        strip_path: true
+        paths:
+          - "/storage/v1/"
+    plugins:
+      - name: cors
+
+  - name: functions-v1
+    _comment: "Edge Functions: /functions/v1/* -> http://functions:9000/*"
+    url: http://functions:9000/
+    routes:
+      - name: functions-v1-all
+        strip_path: true
+        paths:
+          - "/functions/v1/"
+    plugins:
+      - name: cors
+
+plugins:
+  - name: cors
+    config:
+      origins:
+        - "*"
+      methods:
+        - GET
+        - HEAD
+        - PUT
+        - PATCH
+        - POST
+        - DELETE
+      headers:
+        - Accept
+        - Accept-Version
+        - Content-Length
+        - Content-MD5
+        - Content-Type
+        - Date
+        - X-Auth-Token
+        - Authorization
+        - X-Forwarded-For
+        - X-Forwarded-Proto
+        - X-Forwarded-Port
+      exposed_headers:
+        - X-Resource-Count
+      credentials: true
+      max_age: 300
+KONG_EOF
 fi
 
-# Копируем основные файлы конфигурации
-cp -r "$SUPABASE_DIR/docker/volumes/db"/*.sql "$PROJECT_DIR/volumes/db/" 2>/dev/null || true
-cp "$SUPABASE_DIR/docker/volumes/api/kong.yml" "$PROJECT_DIR/volumes/api/" 2>/dev/null || true
+# Создаем базовые SQL файлы если их нет
+if [ ! -f "$PROJECT_DIR/volumes/db/roles.sql" ]; then
+  echo "⚠️  SQL файлы не найдены, создаю базовые..."
+  
+  cat > "$PROJECT_DIR/volumes/db/roles.sql" <<'SQL_EOF'
+-- Set up Realtime
+create schema if not exists realtime;
+-- create a publication for all tables
+create publication supabase_realtime for all tables;
+
+-- Supabase super admin
+create user supabase_admin;
+alter user supabase_admin with superuser createdb createrole replication bypassrls;
+
+-- Extension namespacing
+create schema if not exists extensions;
+create extension if not exists "uuid-ossp"      with schema extensions;
+create extension if not exists pgcrypto         with schema extensions;
+create extension if not exists pgjwt            with schema extensions;
+
+-- Set up auth roles for the developer
+create role anon                nologin noinherit;
+create role authenticated       nologin noinherit; -- "logged in" user: web_user, app_user, etc
+create role service_role        nologin noinherit bypassrls; -- allow developers to create JWT's that bypass their policies
+
+create user authenticator noinherit;
+grant anon              to authenticator;
+grant authenticated     to authenticator;
+grant service_role      to authenticator;
+grant supabase_admin    to authenticator;
+
+grant usage                     on schema public to anon, authenticated, service_role;
+alter default privileges in schema public grant all on tables to anon, authenticated, service_role;
+alter default privileges in schema public grant all on functions to anon, authenticated, service_role;
+alter default privileges in schema public grant all on sequences to anon, authenticated, service_role;
+
+-- Allow Extensions to be used in the API
+grant usage                     on schema extensions to anon, authenticated, service_role;
+
+-- Set up namespacing
+alter user supabase_admin SET search_path TO public, extensions; -- don't include the "auth" schema
+
+-- These are required so that the users receive the permissions
+grant supabase_admin to postgres;
+grant all privileges on all tables in schema public to supabase_admin;
+grant all privileges on all functions in schema public to supabase_admin;
+grant all privileges on all sequences in schema public to supabase_admin;
+SQL_EOF
+
+  cat > "$PROJECT_DIR/volumes/db/realtime.sql" <<'SQL_EOF'
+\echo "Loading Realtime"
+
+-- create schema
+create schema if not exists realtime;
+
+-- create publication
+drop publication if exists supabase_realtime;
+create publication supabase_realtime;
+SQL_EOF
+
+  cat > "$PROJECT_DIR/volumes/db/webhooks.sql" <<'SQL_EOF'
+\echo "Loading Webhooks"
+
+-- create webhooks schema
+create schema if not exists webhooks;
+SQL_EOF
+
+  cat > "$PROJECT_DIR/volumes/db/jwt.sql" <<'SQL_EOF'
+\echo "Loading JWT"
+
+-- Create auth schema
+create schema if not exists auth;
+SQL_EOF
+
+  cat > "$PROJECT_DIR/volumes/db/logs.sql" <<'SQL_EOF'
+\echo "Loading Logs"
+
+-- create _analytics schema
+create schema if not exists _analytics;
+SQL_EOF
+fi
 
 # Создаем файл конфигурации Vector
 cat > "$PROJECT_DIR/volumes/logs/vector.yml" <<EOF
