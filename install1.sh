@@ -17,10 +17,10 @@ SERVER_IP=$(curl -s ifconfig.me)
 LETSENCRYPT_EMAIL="ppcdolar@gmail.com"
 
 PROJECT_DIR="$HOME/project"
+SUPABASE_DIR="$PROJECT_DIR/supabase"
+SUPABASE_DOCKER_DIR="$SUPABASE_DIR/docker"
 TRAEFIK_DIR="$PROJECT_DIR/traefik"
 LE_DIR="$PROJECT_DIR/letsencrypt"
-N8N_DIR="$PROJECT_DIR/n8n"
-SITE_DIR="$PROJECT_DIR/site"
 
 # ---------- ОПРЕДЕЛЕНИЕ РЕЖИМА ----------
 MODE="staging" # по умолчанию тестовые сертификаты
@@ -34,22 +34,29 @@ fi
 # ---------- РЕЖИМ ОБНОВЛЕНИЯ ----------
 if [[ "$MODE" == "update" ]]; then
     echo "🔄 Режим обновления..."
-    if [ ! -f "$PROJECT_DIR/docker-compose.yml" ]; then
+
+    if ! docker network ls --format '{{.Name}}' | grep -q "^traefik-net$"; then
+        echo "❌ Сеть traefik-net не найдена — нужно сначала выполнить полную установку."
+        exit 1
+    fi
+
+    if [ ! -d "$PROJECT_DIR" ] || [ ! -d "$SUPABASE_DOCKER_DIR" ]; then
         echo "❌ Проект не найден — сначала выполните установку."
         exit 1
     fi
 
-    echo "📦 Обновляю весь стек..."
+    echo "📦 Обновляю все сервисы..."
     cd "$PROJECT_DIR"
     docker compose pull
     docker compose up -d --build
+
     echo "✅ Обновление завершено."
     exit 0
 fi
 
 # ---------- ПОЛНАЯ УСТАНОВКА ----------
 echo "Проект будет установлен в: $PROJECT_DIR"
-mkdir -p "$PROJECT_DIR" "$TRAEFIK_DIR" "$LE_DIR" "$N8N_DIR/data" "$SITE_DIR"
+mkdir -p "$PROJECT_DIR" "$SUPABASE_DOCKER_DIR" "$TRAEFIK_DIR" "$LE_DIR"
 
 # ---------- ОБНОВЛЕНИЕ СИСТЕМЫ ----------
 echo "📦 Обновляем систему..."
@@ -81,39 +88,17 @@ else
   echo "Docker уже установлен."
 fi
 
-# ---------- .ENV ДЛЯ ВСЕГО ПРОЕКТА ----------
-ENV_FILE="$PROJECT_DIR/.env"
-if [ ! -f "$ENV_FILE" ]; then
-  echo "Генерирую .env для всего стека..."
-  gen_secret() { openssl rand -base64 32 | tr -d '/+=' | head -c 32; }
-  gen_hex() { openssl rand -hex 32; }
-
-  cat > "$ENV_FILE" <<EOF
-# Supabase
-POSTGRES_PASSWORD=$(gen_hex)
-POSTGRES_USER=postgres
-POSTGRES_DB=postgres
-JWT_SECRET=$(gen_secret)
-ANON_KEY=$(gen_secret)
-SERVICE_ROLE_KEY=$(gen_secret)
-SUPABASE_PUBLIC_URL=https://$SUPABASE_DOMAIN
-API_EXTERNAL_URL=https://$SUPABASE_DOMAIN
-STUDIO_PORT=3000
-
-# n8n
-N8N_BASIC_AUTH_USER=admin
-N8N_BASIC_AUTH_PASSWORD=$(gen_secret)
-GENERIC_TIMEZONE=Europe/Amsterdam
-N8N_HOST=$N8N_DOMAIN
-N8N_PROTOCOL=https
-EOF
-  chmod 600 "$ENV_FILE"
+# ---------- КЛОНИРОВАНИЕ SUPABASE ----------
+if [ ! -d "$SUPABASE_DIR" ]; then
+  echo "Клонирую официальный Supabase репозиторий..."
+  git clone https://github.com/supabase/supabase.git "$SUPABASE_DIR"
 else
-  echo ".env файл уже существует."
+  echo "Supabase репозиторий уже присутствует."
 fi
 
 # ---------- СОЗДАНИЕ КОНФИГА TRAEFIK ----------
 echo "Создаю конфигурацию Traefik..."
+
 CASERVER_LINE=""
 if [[ "$MODE" == "staging" ]]; then
   CASERVER_LINE="      caServer: https://acme-staging-v02.api.letsencrypt.org/directory"
@@ -128,17 +113,11 @@ api:
 entryPoints:
   web:
     address: ":80"
-    http:
-      redirections:
-        entryPoint:
-          to: websecure
-          scheme: https
   websecure:
     address: ":443"
 providers:
   docker:
     exposedByDefault: false
-    network: traefik-net
 certificatesResolvers:
   letsencrypt:
     acme:
@@ -155,58 +134,104 @@ if [ ! -f "$LE_DIR/acme.json" ]; then
   touch "$LE_DIR/acme.json"
   chmod 600 "$LE_DIR/acme.json"
 else
-  echo "Использую существующий acme.json"
+  echo "Использую существующий acme.json (сертификаты не будут пересозданы)"
 fi
 
-# ---------- ПРОСТОЙ САЙТ ----------
-cat > "$SITE_DIR/Dockerfile" <<EOF
-FROM nginx:stable-alpine
-COPY index.html /usr/share/nginx/html/index.html
-EOF
+# ---------- СОЗДАНИЕ СЕТИ TRAEFIK-NET ----------
+if ! docker network ls --format '{{.Name}}' | grep -q "^traefik-net$"; then
+  echo "Создаю сеть traefik-net..."
+  docker network create traefik-net
+else
+  echo "Сеть traefik-net уже существует."
+fi
 
-cat > "$SITE_DIR/index.html" <<EOF
-<!doctype html>
-<html>
-  <head><meta charset="utf-8"><title>Automation Bot</title></head>
-  <body>
-    <h1>Automation Bot — сайт работает</h1>
-    <ul>
-      <li><a href="https://$STUDIO_DOMAIN">Supabase Studio</a></li>
-      <li><a href="https://$N8N_DOMAIN">n8n</a></li>
-      <li><a href="https://$TRAEFIK_DOMAIN">Traefik Dashboard</a></li>
-    </ul>
-  </body>
-</html>
-EOF
+# ---------- .ENV ДЛЯ SUPABASE ----------
+SUP_ENV_FILE="$SUPABASE_DOCKER_DIR/.env"
+mkdir -p "$SUPABASE_DOCKER_DIR"
 
-# ---------- ЕДИНЫЙ DOCKER-COMPOSE.YML ----------
-echo "Создаю единый docker-compose.yml для всего стека..."
+gen_secret() { openssl rand -base64 48 | tr -d '\n'; }
+gen_hex() { openssl rand -hex 32; }
+
+if [ ! -f "$SUP_ENV_FILE" ]; then
+  echo "Генерирую .env для Supabase..."
+  cat > "$SUP_ENV_FILE" <<EOF
+POSTGRES_PASSWORD=$(gen_hex)
+POSTGRES_USER=postgres
+POSTGRES_DB=postgres
+POSTGRES_HOST=db
+POSTGRES_PORT=5432
+JWT_SECRET=$(gen_secret)
+JWT_EXPIRY=3600
+ANON_KEY=$(gen_secret)
+SERVICE_ROLE_KEY=$(gen_secret)
+VAULT_ENC_KEY=$(gen_secret)
+LOGFLARE_PUBLIC_ACCESS_TOKEN=$(gen_secret)
+LOGFLARE_PRIVATE_ACCESS_TOKEN=$(gen_secret)
+DASHBOARD_USERNAME=admin
+DASHBOARD_PASSWORD=$(gen_secret)
+SECRET_KEY_BASE=$(gen_secret)
+SMTP_HOST=smtp.$DOMAIN_BASE
+SMTP_PORT=587
+SMTP_USER=no-reply@$DOMAIN_BASE
+SMTP_PASS=$(gen_secret)
+SMTP_ADMIN_EMAIL=admin@$DOMAIN_BASE
+SMTP_SENDER_NAME=Supabase
+SUPABASE_PUBLIC_URL=https://$SUPABASE_DOMAIN
+API_EXTERNAL_URL=https://$SUPABASE_DOMAIN
+ADDITIONAL_REDIRECT_URLS=https://$N8N_DOMAIN
+MAILER_URLPATHS_CONFIRMATION=/auth/confirm
+MAILER_URLPATHS_RECOVERY=/auth/recover
+MAILER_URLPATHS_INVITE=/auth/invite
+MAILER_URLPATHS_EMAIL_CHANGE=/auth/change
+ENABLE_EMAIL_SIGNUP=true
+ENABLE_ANONYMOUS_USERS=false
+ENABLE_PHONE_SIGNUP=false
+ENABLE_PHONE_AUTOCONFIRM=false
+ENABLE_EMAIL_AUTOCONFIRM=false
+DISABLE_SIGNUP=false
+PGRST_DB_SCHEMAS=public
+FUNCTIONS_VERIFY_JWT=true
+DOCKER_SOCKET_LOCATION=/var/run/docker.sock
+IMGPROXY_ENABLE_WEBP_DETECTION=true
+POOLER_PROXY_PORT_TRANSACTION=6543
+POOLER_TENANT_ID=default
+POOLER_DEFAULT_POOL_SIZE=20
+POOLER_MAX_CLIENT_CONN=100
+POOLER_DB_POOL_SIZE=20
+EOF
+  chmod 600 "$SUP_ENV_FILE"
+else
+  echo ".env для Supabase уже существует."
+fi
+
+# ---------- КОПИРОВАНИЕ И МОДИФИКАЦИЯ DOCKER-COMPOSE SUPABASE ----------
+echo "Копирую и модифицирую docker-compose.yml из Supabase..."
+cp "$SUPABASE_DIR/docker/docker-compose.yml" "$SUPABASE_DOCKER_DIR/docker-compose.yml"
+
+# ---------- ЕДИНЫЙ DOCKER-COMPOSE ДЛЯ ВСЕХ СЕРВИСОВ ----------
+echo "Создаю единый docker-compose.yml..."
 cat > "$PROJECT_DIR/docker-compose.yml" <<EOF
 version: "3.9"
 
 networks:
   traefik-net:
-    name: traefik-net
-
-volumes:
-  db_data:
-  storage_data:
-  n8n_data:
+    external: true
+  default:
+    name: supabase_network_project
 
 services:
-  # Traefik
+  # ========== TRAEFIK ==========
   traefik:
     image: traefik:v3.1
     command:
-      - "--api.dashboard=true"
       - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
       - "--providers.docker.network=traefik-net"
+      - "--log.level=INFO"
       - "--entrypoints.web.address=:80"
       - "--entrypoints.websecure.address=:443"
       - "--certificatesresolvers.letsencrypt.acme.storage=/letsencrypt/acme.json"
-      - "--certificatesresolvers.letsencrypt.acme.email=${LETSENCRYPT_EMAIL}"
-      - "--certificatesresolvers.letsencrypt.acme.httpchallenge.entrypoint=web"
-      - "--log.level=INFO"
+      - "--api.dashboard=true"
     ports:
       - "80:80"
       - "443:443"
@@ -216,7 +241,7 @@ services:
       - "./letsencrypt/acme.json:/letsencrypt/acme.json"
     labels:
       - "traefik.enable=true"
-      - "traefik.http.routers.traefik-dashboard.rule=Host(\`${TRAEFIK_DOMAIN}\`)"
+      - "traefik.http.routers.traefik-dashboard.rule=Host(\`$TRAEFIK_DOMAIN\`)"
       - "traefik.http.routers.traefik-dashboard.entrypoints=websecure"
       - "traefik.http.routers.traefik-dashboard.tls.certresolver=letsencrypt"
       - "traefik.http.routers.traefik-dashboard.service=api@internal"
@@ -224,12 +249,14 @@ services:
       - traefik-net
     restart: unless-stopped
 
-  # Site
+  # ========== САЙТ ==========
   site:
     build: ./site
+    depends_on:
+      - traefik
     labels:
       - "traefik.enable=true"
-      - "traefik.http.routers.site.rule=Host(\`${SITE_DOMAIN}\`)"
+      - "traefik.http.routers.site.rule=Host(\`$SITE_DOMAIN\`)"
       - "traefik.http.routers.site.entrypoints=websecure"
       - "traefik.http.routers.site.tls.certresolver=letsencrypt"
       - "traefik.http.services.site.loadbalancer.server.port=80"
@@ -237,21 +264,23 @@ services:
       - traefik-net
     restart: unless-stopped
 
-  # n8n
+  # ========== N8N ==========
   n8n:
     image: n8nio/n8n:latest
+    depends_on:
+      - traefik
     environment:
       - N8N_BASIC_AUTH_ACTIVE=true
-      - N8N_BASIC_AUTH_USER=\${N8N_BASIC_AUTH_USER}
-      - N8N_BASIC_AUTH_PASSWORD=\${N8N_BASIC_AUTH_PASSWORD}
-      - GENERIC_TIMEZONE=\${GENERIC_TIMEZONE}
-      - N8N_HOST=\${N8N_HOST}
-      - N8N_PROTOCOL=\${N8N_PROTOCOL}
+      - N8N_BASIC_AUTH_USER=admin
+      - N8N_BASIC_AUTH_PASSWORD=$(openssl rand -base64 16 | tr -d '\n')
+      - GENERIC_TIMEZONE=Europe/Amsterdam
+      - N8N_HOST=$N8N_DOMAIN
+      - N8N_PROTOCOL=https
     volumes:
-      - "n8n_data:/home/node/.n8n"
+      - ./n8n/data:/home/node/.n8n
     labels:
       - "traefik.enable=true"
-      - "traefik.http.routers.n8n.rule=Host(\`${N8N_DOMAIN}\`)"
+      - "traefik.http.routers.n8n.rule=Host(\`$N8N_DOMAIN\`)"
       - "traefik.http.routers.n8n.entrypoints=websecure"
       - "traefik.http.routers.n8n.tls.certresolver=letsencrypt"
       - "traefik.http.services.n8n.loadbalancer.server.port=5678"
@@ -259,127 +288,507 @@ services:
       - traefik-net
     restart: unless-stopped
 
-  # Supabase DB
+  # ========== SUPABASE СЕРВИСЫ ==========
+  # Postgres
   db:
+    container_name: supabase-db
     image: supabase/postgres:15.1.0.117
+    healthcheck:
+      test: pg_isready -U postgres -h localhost
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    depends_on:
+      - traefik
+    command:
+      - postgres
+      - -c
+      - config_file=/etc/postgresql/postgresql.conf
+      - -c
+      - log_min_messages=fatal
+    restart: unless-stopped
+    ports:
+      - 5432:5432
     environment:
-      - POSTGRES_USER=\${POSTGRES_USER}
-      - POSTGRES_PASSWORD=\${POSTGRES_PASSWORD}
-      - POSTGRES_DB=\${POSTGRES_DB}
+      POSTGRES_HOST: /var/run/postgresql
+      PGPORT: 5432
+      POSTGRES_PORT: 5432
+      PGPASSWORD: \${POSTGRES_PASSWORD}
+      POSTGRES_PASSWORD: \${POSTGRES_PASSWORD}
+      PGDATABASE: \${POSTGRES_DB}
+      POSTGRES_DB: \${POSTGRES_DB}
+      PGUSER: \${POSTGRES_USER}
+      POSTGRES_USER: \${POSTGRES_USER}
+      POSTGRES_INITDB_ARGS: "--auth-host=md5"
     volumes:
-      - db_data:/var/lib/postgresql/data
+      - ./volumes/db/realtime.sql:/docker-entrypoint-initdb.d/migrations/99-realtime.sql:Z
+      - ./volumes/db/webhooks.sql:/docker-entrypoint-initdb.d/init-scripts/98-webhooks.sql:Z
+      - ./volumes/db/roles.sql:/docker-entrypoint-initdb.d/init-scripts/99-roles.sql:Z
+      - ./volumes/db/jwt.sql:/docker-entrypoint-initdb.d/init-scripts/99-jwt.sql:Z
+      - ./volumes/db/data:/var/lib/postgresql/data:Z
+      - ./volumes/db/logs.sql:/docker-entrypoint-initdb.d/migrations/99-logs.sql:Z
+    env_file:
+      - ./supabase/docker/.env
     networks:
-      - traefik-net
-    restart: unless-stopped
+      - default
 
-  # Supabase API Gateway
-  kong:
-    image: supabase/kong:2.8.1-20220817
-    environment:
-      - KONG_DATABASE=off
-      - KONG_DECLARATIVE_CONFIG=/var/lib/kong/kong.yml
-      - KONG_DNS_ORDER=LAST,A,CNAME
-      - KONG_PLUGINS=request-transformer,cors,key-auth,acl
-    labels:
-      - "traefik.enable=true"
-      - "traefik.http.routers.supabase-api.rule=Host(\`${SUPABASE_DOMAIN}\`)"
-      - "traefik.http.routers.supabase-api.entrypoints=websecure"
-      - "traefik.http.routers.supabase-api.tls.certresolver=letsencrypt"
-      - "traefik.http.services.supabase-api.loadbalancer.server.port=8000"
-    networks:
-      - traefik-net
-    restart: unless-stopped
-
-  # Supabase Services
-  auth:
-    image: supabase/gotrue:v2.128.1
-    environment:
-      - GOTRUE_API_HOST=0.0.0.0
-      - GOTRUE_API_PORT=9999
-      - GOTRUE_JWT_SECRET=\${JWT_SECRET}
-      - GOTRUE_JWT_EXP=3600
-      - GOTRUE_SITE_URL=\${SUPABASE_PUBLIC_URL}
-      - GOTRUE_URI_SCHEMES=https
-      - GOTRUE_DATABASE_URL=postgres://\${POSTGRES_USER}:\${POSTGRES_PASSWORD}@db:5432/\${POSTGRES_DB}
-    networks:
-      - traefik-net
-    restart: unless-stopped
-
-  rest:
-    image: postgrest/postgrest:v11.2.2
-    environment:
-      - PGRST_DB_URI=postgres://\${POSTGRES_USER}:\${POSTGRES_PASSWORD}@db:5432/\${POSTGRES_DB}
-      - PGRST_DB_SCHEMAS=public,storage,graphql_public
-      - PGRST_DB_ANON_ROLE=anon
-      - PGRST_JWT_SECRET=\${JWT_SECRET}
-    networks:
-      - traefik-net
-    restart: unless-stopped
-
-  realtime:
-    image: supabase/realtime:v2.26.1
-    environment:
-      - REALTIME_POSTGRES_HOST=db
-      - REALTIME_POSTGRES_PORT=5432
-      - REALTIME_POSTGRES_USER=\${POSTGRES_USER}
-      - REALTIME_POSTGRES_PASSWORD=\${POSTGRES_PASSWORD}
-      - REALTIME_POSTGRES_DBNAME=\${POSTGRES_DB}
-      - REALTIME_PORT=4000
-      - REALTIME_JWT_SECRET=\${JWT_SECRET}
-    networks:
-      - traefik-net
-    restart: unless-stopped
-
-  storage-api:
-    image: supabase/storage-api:v0.47.0
-    environment:
-      - STORAGE_DATABASE_URL=postgres://\${POSTGRES_USER}:\${POSTGRES_PASSWORD}@db:5432/\${POSTGRES_DB}
-      - STORAGE_BACKEND=file
-      - FILE_STORAGE_BACKEND_PATH=/var/lib/storage
-      - TENANT_ID=stub
-      - ANON_KEY=\${ANON_KEY}
-      - SERVICE_ROLE_KEY=\${SERVICE_ROLE_KEY}
-      - JWT_SECRET=\${JWT_SECRET}
-    volumes:
-      - storage_data:/var/lib/storage
-    networks:
-      - traefik-net
-    restart: unless-stopped
-
-  # Supabase Studio
+  # Studio
   studio:
-    image: supabase/studio:20240711-0604
+    container_name: supabase-studio
+    image: supabase/studio:20240326-5e5586d
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:3000/api/profile', (r) => {if (r.statusCode !== 200) throw new Error(r.statusCode)})"]
+      timeout: 5s
+      interval: 5s
+      retries: 3
+    depends_on:
+      db:
+        condition: service_healthy
     environment:
-      - SUPABASE_PUBLIC_URL=https://\${SUPABASE_DOMAIN}
-      - SUPABASE_API_URL=https://\${API_EXTERNAL_URL}
-      - SUPABASE_DB_HOST=db
-      - SUPABASE_DB_USER=\${POSTGRES_USER}
-      - SUPABASE_DB_PASSWORD=\${POSTGRES_PASSWORD}
-      - SUPABASE_DB_PORT=5432
-      - ANON_KEY=\${ANON_KEY}
-      - SERVICE_ROLE_KEY=\${SERVICE_ROLE_KEY}
+      STUDIO_PG_META_URL: http://meta:8080
+      POSTGRES_PASSWORD: \${POSTGRES_PASSWORD}
+      DEFAULT_ORGANIZATION_NAME: \${STUDIO_DEFAULT_ORGANIZATION}
+      DEFAULT_PROJECT_NAME: \${STUDIO_DEFAULT_PROJECT}
+      SUPABASE_URL: http://kong:8000
+      SUPABASE_PUBLIC_URL: \${SUPABASE_PUBLIC_URL}
+      SUPABASE_ANON_KEY: \${ANON_KEY}
+      SUPABASE_SERVICE_KEY: \${SERVICE_ROLE_KEY}
+      LOGFLARE_API_KEY: \${LOGFLARE_API_KEY}
+      LOGFLARE_URL: http://analytics:4000
+      NEXT_PUBLIC_ENABLE_LOGS: true
+      NEXT_ANALYTICS_BACKEND_PROVIDER: postgres
+    env_file:
+      - ./supabase/docker/.env
     labels:
       - "traefik.enable=true"
-      - "traefik.http.routers.supabase-studio.rule=Host(\`${STUDIO_DOMAIN}\`)"
+      - "traefik.http.routers.supabase-studio.rule=Host(\`$STUDIO_DOMAIN\`)"
       - "traefik.http.routers.supabase-studio.entrypoints=websecure"
       - "traefik.http.routers.supabase-studio.tls.certresolver=letsencrypt"
-      - "traefik.http.services.supabase-studio.loadbalancer.server.port=${STUDIO_PORT}"
+      - "traefik.http.services.supabase-studio.loadbalancer.server.port=3000"
     networks:
       - traefik-net
+      - default
+
+  # Kong
+  kong:
+    container_name: supabase-kong
+    image: kong:2.8.1
     restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      KONG_DATABASE: "off"
+      KONG_DECLARATIVE_CONFIG: /var/lib/kong/kong.yml
+      KONG_DNS_ORDER: LAST,A,CNAME
+      KONG_PLUGINS: request-transformer,cors,key-auth,acl,basic-auth
+      KONG_NGINX_PROXY_PROXY_BUFFER_SIZE: 160k
+      KONG_NGINX_PROXY_PROXY_BUFFERS: 64 160k
+    volumes:
+      - ./volumes/api/kong.yml:/var/lib/kong/kong.yml:ro
+    env_file:
+      - ./supabase/docker/.env
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.supabase.rule=Host(\`$SUPABASE_DOMAIN\`)"
+      - "traefik.http.routers.supabase.entrypoints=websecure"
+      - "traefik.http.routers.supabase.tls.certresolver=letsencrypt"
+      - "traefik.http.services.supabase.loadbalancer.server.port=8000"
+    networks:
+      - traefik-net
+      - default
+
+  # Auth
+  auth:
+    container_name: supabase-auth
+    image: supabase/gotrue:v2.143.0
+    depends_on:
+      db:
+        condition: service_healthy
+      analytics:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:9999/health"]
+      timeout: 5s
+      interval: 5s
+      retries: 3
+    restart: unless-stopped
+    environment:
+      GOTRUE_API_HOST: 0.0.0.0
+      GOTRUE_API_PORT: 9999
+      API_EXTERNAL_URL: \${API_EXTERNAL_URL}
+      GOTRUE_DB_DRIVER: postgres
+      GOTRUE_DB_DATABASE_URL: postgres://supabase_auth_admin:\${POSTGRES_PASSWORD}@\${POSTGRES_HOST}:\${POSTGRES_PORT}/\${POSTGRES_DB}
+      GOTRUE_SITE_URL: \${SITE_URL}
+      GOTRUE_URI_ALLOW_LIST: \${ADDITIONAL_REDIRECT_URLS}
+      GOTRUE_DISABLE_SIGNUP: \${DISABLE_SIGNUP}
+      GOTRUE_JWT_ADMIN_ROLES: service_role
+      GOTRUE_JWT_AUD: authenticated
+      GOTRUE_JWT_DEFAULT_GROUP_NAME: authenticated
+      GOTRUE_JWT_EXP: \${JWT_EXPIRY}
+      GOTRUE_JWT_SECRET: \${JWT_SECRET}
+      GOTRUE_EXTERNAL_EMAIL_ENABLED: \${ENABLE_EMAIL_SIGNUP}
+      GOTRUE_EXTERNAL_ANONYMOUS_USERS_ENABLED: \${ENABLE_ANONYMOUS_USERS}
+      GOTRUE_MAILER_AUTOCONFIRM: \${ENABLE_EMAIL_AUTOCONFIRM}
+      GOTRUE_SMTP_HOST: \${SMTP_HOST}
+      GOTRUE_SMTP_PORT: \${SMTP_PORT}
+      GOTRUE_SMTP_USER: \${SMTP_USER}
+      GOTRUE_SMTP_PASS: \${SMTP_PASS}
+      GOTRUE_SMTP_SENDER_NAME: \${SMTP_SENDER_NAME}
+      GOTRUE_MAILER_URLPATHS_INVITE: \${MAILER_URLPATHS_INVITE}
+      GOTRUE_MAILER_URLPATHS_CONFIRMATION: \${MAILER_URLPATHS_CONFIRMATION}
+      GOTRUE_MAILER_URLPATHS_RECOVERY: \${MAILER_URLPATHS_RECOVERY}
+      GOTRUE_MAILER_URLPATHS_EMAIL_CHANGE: \${MAILER_URLPATHS_EMAIL_CHANGE}
+      GOTRUE_EXTERNAL_PHONE_ENABLED: \${ENABLE_PHONE_SIGNUP}
+      GOTRUE_SMS_AUTOCONFIRM: \${ENABLE_PHONE_AUTOCONFIRM}
+    env_file:
+      - ./supabase/docker/.env
+    networks:
+      - default
+
+  # REST
+  rest:
+    container_name: supabase-rest
+    image: postgrest/postgrest:v12.0.1
+    depends_on:
+      db:
+        condition: service_healthy
+      analytics:
+        condition: service_healthy
+    restart: unless-stopped
+    environment:
+      PGRST_DB_URI: postgres://authenticator:\${POSTGRES_PASSWORD}@\${POSTGRES_HOST}:\${POSTGRES_PORT}/\${POSTGRES_DB}
+      PGRST_DB_SCHEMAS: \${PGRST_DB_SCHEMAS}
+      PGRST_DB_ANON_ROLE: anon
+      PGRST_JWT_SECRET: \${JWT_SECRET}
+      PGRST_DB_USE_LEGACY_GUCS: "false"
+      PGRST_APP_SETTINGS_JWT_SECRET: \${JWT_SECRET}
+      PGRST_APP_SETTINGS_JWT_EXP: \${JWT_EXPIRY}
+    command: "postgrest"
+    env_file:
+      - ./supabase/docker/.env
+    networks:
+      - default
+
+  # Realtime
+  realtime:
+    container_name: supabase-realtime
+    image: supabase/realtime:v2.25.50
+    depends_on:
+      db:
+        condition: service_healthy
+      analytics:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "bash", "-c", "printf \\0 > /dev/tcp/localhost/4000"]
+      timeout: 5s
+      interval: 5s
+      retries: 3
+    restart: unless-stopped
+    environment:
+      PORT: 4000
+      DB_HOST: \${POSTGRES_HOST}
+      DB_PORT: \${POSTGRES_PORT}
+      DB_USER: supabase_realtime_admin
+      DB_PASSWORD: \${POSTGRES_PASSWORD}
+      DB_NAME: \${POSTGRES_DB}
+      DB_AFTER_CONNECT_QUERY: 'SET search_path TO _realtime'
+      DB_ENC_KEY: supabaserealtimedev
+      API_JWT_SECRET: \${JWT_SECRET}
+      FLY_ALLOC_ID: fly123
+      FLY_APP_NAME: realtime
+      SECRET_KEY_BASE: UpNVntn3cDxHJpq99YMc1T1AQgQpc8kfYTuRgBiYa15BLrx8etQoXz3gZv1/u2oq
+      ERL_AFLAGS: -proto_dist inet_tcp
+      ENABLE_TAILSCALE: "false"
+      DNS_NODES: "''"
+    env_file:
+      - ./supabase/docker/.env
+    command: >
+      sh -c "/app/bin/migrate && /app/bin/realtime eval 'Realtime.Release.seeds(Realtime.Repo)' && /app/bin/server"
+    networks:
+      - default
+
+  # Storage
+  storage:
+    container_name: supabase-storage
+    image: supabase/storage-api:v0.43.11
+    depends_on:
+      db:
+        condition: service_healthy
+      rest:
+        condition: service_started
+      imgproxy:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:5000/status"]
+      timeout: 5s
+      interval: 5s
+      retries: 3
+    restart: unless-stopped
+    environment:
+      ANON_KEY: \${ANON_KEY}
+      SERVICE_KEY: \${SERVICE_ROLE_KEY}
+      POSTGREST_URL: http://rest:3000
+      PGRST_JWT_SECRET: \${JWT_SECRET}
+      DATABASE_URL: postgres://supabase_storage_admin:\${POSTGRES_PASSWORD}@\${POSTGRES_HOST}:\${POSTGRES_PORT}/\${POSTGRES_DB}
+      FILE_SIZE_LIMIT: 52428800
+      STORAGE_BACKEND: file
+      FILE_STORAGE_BACKEND_PATH: /var/lib/storage
+      TENANT_ID: stub
+      REGION: stub
+      GLOBAL_S3_BUCKET: stub
+      ENABLE_IMAGE_TRANSFORMATION: "true"
+      IMGPROXY_URL: http://imgproxy:5001
+    volumes:
+      - ./volumes/storage:/var/lib/storage:z
+    env_file:
+      - ./supabase/docker/.env
+    networks:
+      - default
+
+  # Image proxy
+  imgproxy:
+    container_name: supabase-imgproxy
+    image: darthsim/imgproxy:v3.8.0
+    healthcheck:
+      test: ["CMD", "imgproxy", "health"]
+      timeout: 5s
+      interval: 5s
+      retries: 3
+    environment:
+      IMGPROXY_BIND: ":5001"
+      IMGPROXY_LOCAL_FILESYSTEM_ROOT: /
+      IMGPROXY_USE_ETAG: "true"
+      IMGPROXY_ENABLE_WEBP_DETECTION: \${IMGPROXY_ENABLE_WEBP_DETECTION}
+    volumes:
+      - ./volumes/storage:/var/lib/storage:z
+    env_file:
+      - ./supabase/docker/.env
+    networks:
+      - default
+
+  # Meta
+  meta:
+    container_name: supabase-meta
+    image: supabase/postgres-meta:v0.68.0
+    depends_on:
+      db:
+        condition: service_healthy
+      analytics:
+        condition: service_healthy
+    restart: unless-stopped
+    environment:
+      PG_META_PORT: 8080
+      PG_META_DB_HOST: \${POSTGRES_HOST}
+      PG_META_DB_PORT: \${POSTGRES_PORT}
+      PG_META_DB_NAME: \${POSTGRES_DB}
+      PG_META_DB_USER: supabase_admin
+      PG_META_DB_PASSWORD: \${POSTGRES_PASSWORD}
+    env_file:
+      - ./supabase/docker/.env
+    networks:
+      - default
+
+  # Functions
+  functions:
+    container_name: supabase-edge-functions
+    image: supabase/edge-runtime:v1.45.2
+    restart: unless-stopped
+    depends_on:
+      analytics:
+        condition: service_healthy
+    environment:
+      JWT_SECRET: \${JWT_SECRET}
+      SUPABASE_URL: http://kong:8000
+      SUPABASE_ANON_KEY: \${ANON_KEY}
+      SUPABASE_SERVICE_ROLE_KEY: \${SERVICE_ROLE_KEY}
+      SUPABASE_DB_URL: postgresql://postgres:\${POSTGRES_PASSWORD}@\${POSTGRES_HOST}:\${POSTGRES_PORT}/\${POSTGRES_DB}
+      VERIFY_JWT: \${FUNCTIONS_VERIFY_JWT}
+    volumes:
+      - ./volumes/functions:/home/deno/functions:Z
+    command:
+      - start
+      - --main-service
+      - /home/deno/functions/main
+    env_file:
+      - ./supabase/docker/.env
+    networks:
+      - default
+
+  # Analytics
+  analytics:
+    container_name: supabase-analytics
+    image: supabase/logflare:1.4.0
+    healthcheck:
+      test: ["CMD", "curl", "http://localhost:4000/health"]
+      timeout: 5s
+      interval: 5s
+      retries: 10
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      LOGFLARE_NODE_HOST: 127.0.0.1
+      DB_USERNAME: supabase_admin
+      DB_DATABASE: \${POSTGRES_DB}
+      DB_HOSTNAME: \${POSTGRES_HOST}
+      DB_PORT: \${POSTGRES_PORT}
+      DB_PASSWORD: \${POSTGRES_PASSWORD}
+      DB_SCHEMA: _analytics
+      LOGFLARE_API_KEY: \${LOGFLARE_API_KEY}
+      LOGFLARE_SINGLE_TENANT: true
+      LOGFLARE_SUPABASE_MODE: true
+      LOGFLARE_MIN_CLUSTER_SIZE: 1
+      RELEASE_COOKIE: cookie
+    env_file:
+      - ./supabase/docker/.env
+    entrypoint: |
+      sh -c `cat <<'EOF'
+      /app/bin/migrate
+      /app/bin/logflare eval 'Logflare.Release.seeds(Logflare.Repo)'
+      /app/bin/logflare start --smp=1
+      EOF
+      `
+    networks:
+      - default
+
+  # Vector
+  vector:
+    container_name: supabase-vector
+    image: timberio/vector:0.28.1-alpine
+    healthcheck:
+      test: ["CMD", "vector", "--version"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    volumes:
+      - ./volumes/logs/vector.yml:/etc/vector/vector.yml:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    environment:
+      LOGFLARE_API_KEY: \${LOGFLARE_API_KEY}
+    env_file:
+      - ./supabase/docker/.env
+    networks:
+      - default
 EOF
 
-# ---------- ЗАПУСК ВСЕГО СТЕКА ----------
+# ---------- КОПИРОВАНИЕ НЕОБХОДИМЫХ ФАЙЛОВ SUPABASE ----------
+echo "Копирую необходимые файлы Supabase..."
+mkdir -p "$PROJECT_DIR/volumes/db"
+mkdir -p "$PROJECT_DIR/volumes/api"
+mkdir -p "$PROJECT_DIR/volumes/storage"
+mkdir -p "$PROJECT_DIR/volumes/functions"
+mkdir -p "$PROJECT_DIR/volumes/logs"
+
+# Копируем SQL файлы инициализации
+if [ -f "$SUPABASE_DIR/docker/volumes/db/init/data.sql" ]; then
+  cp "$SUPABASE_DIR/docker/volumes/db/init/data.sql" "$PROJECT_DIR/volumes/db/"
+fi
+
+# Копируем основные файлы конфигурации
+cp -r "$SUPABASE_DIR/docker/volumes/db"/*.sql "$PROJECT_DIR/volumes/db/" 2>/dev/null || true
+cp "$SUPABASE_DIR/docker/volumes/api/kong.yml" "$PROJECT_DIR/volumes/api/" 2>/dev/null || true
+
+# Создаем файл конфигурации Vector
+cat > "$PROJECT_DIR/volumes/logs/vector.yml" <<EOF
+data_dir: /tmp/vector/
+api:
+  enabled: true
+  address: 0.0.0.0:8686
+sources:
+  docker_host:
+    type: docker_logs
+    include_labels:
+      - "com.docker.compose.project=supabase"
+sinks:
+  logflare_logs:
+    type: http
+    inputs: ["docker_host"]
+    uri: http://analytics:4000/logs/logflare?source_token=\${LOGFLARE_API_KEY}&source=\${VECTOR_SOURCE}
+    method: post
+    healthcheck_uri: http://analytics:4000/health
+    buffer:
+      type: disk
+      max_size: 104857600
+      when_full: block
+    request:
+      strategy: adaptive
+      retry_max_duration_secs: 10
+      retry_initial_backoff_secs: 2
+      timeout_secs: 60
+    batch:
+      max_bytes: 1048576
+      timeout_secs: 5
+    compression: gzip
+    encoding:
+      codec: json
+    auth:
+      strategy: bearer
+      token: \${LOGFLARE_API_KEY}
+EOF
+
+# ---------- ПРОСТОЙ САЙТ ----------
+mkdir -p "$PROJECT_DIR/site"
+cat > "$PROJECT_DIR/site/Dockerfile" <<EOF
+FROM nginx:stable-alpine
+COPY index.html /usr/share/nginx/html/index.html
+EOF
+
+cat > "$PROJECT_DIR/site/index.html" <<EOF
+<!doctype html>
+<html>
+  <head><meta charset="utf-8"><title>Automation Bot</title></head>
+  <body>
+    <h1>Automation Bot — сайт работает</h1>
+    <ul>
+      <li><a href="https://$SUPABASE_DOMAIN">Supabase</a></li>
+      <li><a href="https://$STUDIO_DOMAIN">Supabase Studio</a></li>
+      <li><a href="https://$N8N_DOMAIN">n8n</a></li>
+      <li><a href="https://$TRAEFIK_DOMAIN">Traefik Dashboard</a></li>
+    </ul>
+  </body>
+</html>
+EOF
+
+# ---------- ЗАПУСК ВСЕХ СЕРВИСОВ ----------
+echo "🚀 Запускаю все сервисы..."
 cd "$PROJECT_DIR"
-echo "🚀 Запускаю весь стек одним docker-compose..."
+
+# Создаем директории для данных
+mkdir -p ./n8n/data
+mkdir -p ./volumes/db/data
+
+# Устанавливаем права доступа
+sudo chown -R 1001:1001 ./n8n/data 2>/dev/null || true
+sudo chown -R 999:999 ./volumes/db/data 2>/dev/null || true
+
+# Запускаем сервисы
 docker compose pull
 docker compose up -d --build
 
+# Ждем пока сервисы запустятся
+echo "⏳ Ожидаем запуска сервисов..."
+sleep 30
+
+# Показываем статус
+docker compose ps
+
 echo "✅ Установка завершена!"
-echo "---"
-echo "Доступы:"
-echo "🌐 Сайт: https://$SITE_DOMAIN"
-echo "🔧 n8n: https://$N8N_DOMAIN (Логин: admin, Пароль в файле .env)"
-echo "🚀 Supabase API: https://$SUPABASE_DOMAIN"
-echo "🎨 Supabase Studio: https://$STUDIO_DOMAIN"
-echo "🚦 Traefik Dashboard: https://$TRAEFIK_DOMAIN"
+echo ""
+echo "🌐 Доступные сервисы:"
+echo "   - Основной сайт: https://$SITE_DOMAIN"
+echo "   - Supabase API: https://$SUPABASE_DOMAIN"
+echo "   - Supabase Studio: https://$STUDIO_DOMAIN"
+echo "   - n8n: https://$N8N_DOMAIN"
+echo "   - Traefik Dashboard: https://$TRAEFIK_DOMAIN"
+echo ""
+echo "📋 Полезные команды:"
+echo "   - Посмотреть логи: docker compose logs -f [service_name]"
+echo "   - Перезапустить: docker compose restart [service_name]"
+echo "   - Остановить все: docker compose down"
+echo "   - Обновить: $0 --update"
+echo ""
+echo "🔑 Для n8n используйте логин: admin"
+echo "    Пароль будет показан в логах: docker compose logs n8n | grep PASSWORD"
