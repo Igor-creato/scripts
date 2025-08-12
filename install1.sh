@@ -102,6 +102,12 @@ mkdir -p "$PROJECT_DIR" "$SUPABASE_DOCKER_DIR" "$TRAEFIK_DIR" "$LE_DIR"
 msg "📦 Обновляем систему…"
 sudo apt update && sudo apt upgrade -y
 
+# Git + jq для sparse-checkout и диагностики
+msg "🔧 Устанавливаю git и jq…"
+sudo apt-get update -y
+sudo apt-get install -y git jq
+
+# Docker / Compose
 if ! command -v docker >/dev/null 2>&1; then
   msg "🐳 Ставлю Docker/Compose…"
   sudo apt install -y apt-transport-https ca-certificates curl gnupg lsb-release
@@ -125,12 +131,19 @@ else
   msg "⚠️ Не получил внешний IP, пропускаю строгую проверку DNS."
 fi
 
-# Клоним Supabase
-if [[ ! -d "$SUPABASE_DIR" ]]; then
-  msg "⬇️ Клонирую supabase repo…"
-  git clone https://github.com/supabase/supabase.git "$SUPABASE_DIR"
+# ---------- КЛОНИРОВАНИЕ SUPABASE (sparse-checkout только папки docker) ----------
+if [ -d "$SUPABASE_DOCKER_DIR" ] && [ -f "$SUPABASE_DOCKER_DIR/docker-compose.yml" ]; then
+  msg "ℹ️ Найдена папка $SUPABASE_DOCKER_DIR и файл docker-compose.yml — пропускаю загрузку."
 else
-  msg "ℹ️ Supabase уже есть."
+  msg "⬇️ Загружаю только папку docker из репозитория supabase (sparse checkout)…"
+  rm -rf "$SUPABASE_DIR"
+  git clone --depth 1 --filter=blob:none --sparse https://github.com/supabase/supabase.git "$SUPABASE_DIR"
+  ( cd "$SUPABASE_DIR" && git sparse-checkout set docker )
+  if [ ! -f "$SUPABASE_DOCKER_DIR/docker-compose.yml" ]; then
+    msg "❌ Не найден $SUPABASE_DOCKER_DIR/docker-compose.yml после клонирования."
+    msg "   Проверь соединение с GitHub или попробуй позже."
+    exit 1
+  fi
 fi
 
 # Traefik config (staging/prod)
@@ -239,7 +252,7 @@ services:
     restart: unless-stopped
 EOF
 
-# ---------- OVERRIDE для Supabase: только сеть + Traefik-лейблы на kong и studio ----------
+# ---------- OVERRIDE для Supabase: сеть + Traefik-лейблы на kong и studio ----------
 cat > "$SUPA_TRAEFIK_OVERRIDE" <<EOF
 name: $PROJECT_NAME
 networks:
@@ -323,7 +336,7 @@ MAILER_URLPATHS_RECOVERY=/auth/recover
 MAILER_URLPATHS_INVITE=/auth/invite
 MAILER_URLPATHS_EMAIL_CHANGE=/auth/change
 ENABLE_EMAIL_SIGNUP=true
-ENABLE_ANONYMOUS_USERS=false
+ENABLE_ANONYМОUS_USERS=false
 ENABLE_PHONE_SIGNUP=false
 ENABLE_PHONE_AUTOCONFIRM=false
 ENABLE_EMAIL_AUTOCONFIRM=false
@@ -337,7 +350,13 @@ else
   msg "ℹ️ .env для Supabase уже есть."
 fi
 
-# ---------- ЕДИНЫЙ ЗАПУСК (один проект) ----------
+# ---------- Единый запуск (один проект) ----------
+# Проверка на наличие основного файла Supabase
+if [ ! -f "$SUPABASE_DOCKER_DIR/docker-compose.yml" ]; then
+  msg "❌ $SUPABASE_DOCKER_DIR/docker-compose.yml не найден. Установка Supabase невозможна."
+  exit 1
+fi
+
 # Останавливаем старые остатки одного и того же проекта (если были)
 docker compose \
   -f "$SUPABASE_DOCKER_DIR/docker-compose.yml" \
