@@ -24,12 +24,15 @@ LE_DIR="$PROJECT_DIR/letsencrypt"
 
 BASE_COMPOSE="$PROJECT_DIR/base.compose.yml"
 SUPA_TRAEFIK_OVERRIDE="$PROJECT_DIR/supabase.traefik.override.yml"
+SUPA_DISABLE_SITE_OVERRIDE="$PROJECT_DIR/supabase.disable-site.override.yml"
 
 MODE="staging"
 [[ "${1:-}" == "--update" ]] && MODE="update"
 [[ "${1:-}" == "--prod"   ]] && MODE="prod"
 
 msg(){ echo -e "$*"; }
+gen_secret(){ openssl rand -base64 48 | tr -d '\n'; }
+gen_hex(){ openssl rand -hex 32; }
 
 wait_https_ready() {
   local domain="$1"
@@ -63,6 +66,36 @@ check_cert_issuer() {
   fi
 }
 
+compose_down() {
+  docker compose \
+    --env-file "$SUPABASE_DOCKER_DIR/.env" \
+    -f "$SUPABASE_DOCKER_DIR/docker-compose.yml" \
+    -f "$BASE_COMPOSE" \
+    -f "$SUPA_TRAEFIK_OVERRIDE" \
+    -f "$SUPA_DISABLE_SITE_OVERRIDE" \
+    --project-name "$PROJECT_NAME" down --remove-orphans || true
+}
+
+compose_pull() {
+  docker compose \
+    --env-file "$SUPABASE_DOCKER_DIR/.env" \
+    -f "$SUPABASE_DOCKER_DIR/docker-compose.yml" \
+    -f "$BASE_COMPOSE" \
+    -f "$SUPA_TRAEFIK_OVERRIDE" \
+    -f "$SUPA_DISABLE_SITE_OVERRIDE" \
+    --project-name "$PROJECT_NAME" pull
+}
+
+compose_up() {
+  docker compose \
+    --env-file "$SUPABASE_DOCKER_DIR/.env" \
+    -f "$SUPABASE_DOCKER_DIR/docker-compose.yml" \
+    -f "$BASE_COMPOSE" \
+    -f "$SUPA_TRAEFIK_OVERRIDE" \
+    -f "$SUPA_DISABLE_SITE_OVERRIDE" \
+    --project-name "$PROJECT_NAME" up -d --build
+}
+
 # ---------- UPDATE ----------
 if [[ "$MODE" == "update" ]]; then
   msg "🔄 Обновление (единый проект: $PROJECT_NAME)..."
@@ -70,27 +103,9 @@ if [[ "$MODE" == "update" ]]; then
   [[ ! -d "$SUPABASE_DOCKER_DIR" ]] && { msg "❌ $SUPABASE_DOCKER_DIR не найден. Сначала установка."; exit 1; }
 
   (docker network ls --format '{{.Name}}' | grep -q "^traefik-net$") || docker network create traefik-net
-
-  # Гасим старьё проекта (во всех файлах) без удаления томов
-  docker compose \
-    -f "$SUPABASE_DOCKER_DIR/docker-compose.yml" \
-    -f "$BASE_COMPOSE" \
-    -f "$SUPA_TRAEFIK_OVERRIDE" \
-    --project-name "$PROJECT_NAME" down --remove-orphans || true
-
-  # Обновляем и поднимаем весь стек одной командой и одним именем проекта
-  docker compose \
-    -f "$SUPABASE_DOCKER_DIR/docker-compose.yml" \
-    -f "$BASE_COMPOSE" \
-    -f "$SUPA_TRAEFIK_OVERRIDE" \
-    --project-name "$PROJECT_NAME" pull
-
-  docker compose \
-    -f "$SUPABASE_DOCKER_DIR/docker-compose.yml" \
-    -f "$BASE_COMPOSE" \
-    -f "$SUPA_TRAEFIK_OVERRIDE" \
-    --project-name "$PROJECT_NAME" up -d --build
-
+  compose_down
+  compose_pull
+  compose_up
   msg "✅ Обновление завершено."
   exit 0
 fi
@@ -112,7 +127,7 @@ if ! command -v docker >/dev/null 2>&1; then
   msg "🐳 Ставлю Docker/Compose…"
   sudo apt install -y apt-transport-https ca-certificates curl gnupg lsb-release
   curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /usr/share/keyrings/docker.gpg
-  echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" \
+  echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/sharekeyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" \
     | sudo tee /etc/apt/sources.list.d/docker.list >/dev/null
   sudo apt update
   sudo apt install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
@@ -279,6 +294,16 @@ services:
       - traefik.docker.network=traefik-net
 EOF
 
+# ---------- Отключаем supabase/site (у них свой service site с локальной сборкой) ----------
+cat > "$SUPA_DISABLE_SITE_OVERRIDE" <<'EOF'
+name: project
+services:
+  site:
+    profiles: ["disabled"]
+    image: busybox
+    build: null
+EOF
+
 # ---------- Сайт (статичка) ----------
 mkdir -p "$PROJECT_DIR/site"
 cat > "$PROJECT_DIR/site/Dockerfile" <<'EOF'
@@ -300,12 +325,9 @@ cat > "$PROJECT_DIR/site/index.html" <<EOF
 </html>
 EOF
 
-# ---------- Supabase .env (если нет) ----------
+# ---------- Supabase .env ----------
 SUP_ENV_FILE="$SUPABASE_DOCKER_DIR/.env"
 mkdir -p "$SUPABASE_DOCKER_DIR"
-
-gen_secret(){ openssl rand -base64 48 | tr -d '\n'; }
-gen_hex(){ openssl rand -hex 32; }
 
 if [[ ! -f "$SUP_ENV_FILE" ]]; then
   msg "🔐 Генерирую .env для Supabase…"
@@ -341,11 +363,11 @@ MAILER_URLPATHS_RECOVERY=/auth/recover
 MAILER_URLPATHS_INVITE=/auth/invite
 MAILER_URLPATHS_EMAIL_CHANGE=/auth/change
 
-# --- Kong ports (требуются compose-файлом) ---
+# --- Kong ports ---
 KONG_HTTP_PORT=8000
 KONG_HTTPS_PORT=8443
 
-# --- Studio defaults (можно поменять позже в UI) ---
+# --- Studio defaults ---
 STUDIO_DEFAULT_ORGANIZATION=Default Organization
 STUDIO_DEFAULT_PROJECT=Default Project
 
@@ -358,7 +380,7 @@ LOGFLARE_PRIVATE_ACCESS_TOKEN=$(gen_secret)
 PGRST_DB_SCHEMAS=public
 FUNCTIONS_VERIFY_JWT=true
 
-# --- Docker socket (важно для маунта, иначе будет :/var/run/docker.sock:ro,z) ---
+# --- Docker socket ---
 DOCKER_SOCKET_LOCATION=/var/run/docker.sock
 
 # --- Imgproxy ---
@@ -371,12 +393,12 @@ POOLER_DEFAULT_POOL_SIZE=20
 POOLER_MAX_CLIENT_CONN=100
 POOLER_DB_POOL_SIZE=20
 
-# --- Dashboard (если используешь old dashboard) ---
+# --- Dashboard (legacy) ---
 DASHBOARD_USERNAME=admin
 DASHBOARD_PASSWORD=$(gen_secret)
 SECRET_KEY_BASE=$(gen_secret)
 
-# --- SMTP (поставь реальные при отправке почты) ---
+# --- SMTP ---
 SMTP_HOST=smtp.$DOMAIN_BASE
 SMTP_PORT=587
 SMTP_USER=no-reply@$DOMAIN_BASE
@@ -386,21 +408,23 @@ SMTP_SENDER_NAME=Supabase
 EOF
   chmod 600 "$SUP_ENV_FILE"
 else
-  msg "ℹ️ .env для Supabase уже существует — при необходимости дополни недостающие переменные."
-  # Минимальная гарантия, что критичные переменные присутствуют
-  grep -q '^DOCKER_SOCKET_LOCATION=' "$SUP_ENV_FILE" || echo "DOCKER_SOCKET_LOCATION=/var/run/docker.sock" >> "$SUP_ENV_FILE"
-  grep -q '^SITE_URL=' "$SUP_ENV_FILE" || echo "SITE_URL=https://$SUPABASE_DOMAIN" >> "$SUP_ENV_FILE"
-  grep -q '^KONG_HTTP_PORT=' "$SUP_ENV_FILE" || echo "KONG_HTTP_PORT=8000" >> "$SUP_ENV_FILE"
-  grep -q '^KONG_HTTPS_PORT=' "$SUP_ENV_FILE" || echo "KONG_HTTPS_PORT=8443" >> "$SUP_ENV_FILE"
-  grep -q '^POOLER_PROXY_PORT_TRANSACTION=' "$SUP_ENV_FILE" || cat >> "$SUP_ENV_FILE" <<'EOF'
-POOLER_PROXY_PORT_TRANSACTION=6543
-POOLER_TENANT_ID=default
-POOLER_DEFAULT_POOL_SIZE=20
-POOLER_MAX_CLIENT_CONN=100
-POOLER_DB_POOL_SIZE=20
-EOF
+  msg "ℹ️ .env для Supabase уже существует — дополняю недостающие ключи."
+  add_kv() { grep -q "^$1=" "$SUP_ENV_FILE" || echo "$1=$2" >> "$SUP_ENV_FILE"; }
+  add_kv DOCKER_SOCKET_LOCATION "/var/run/docker.sock"
+  add_kv SITE_URL "https://$SUPABASE_DOMAIN"
+  add_kv KONG_HTTP_PORT "8000"
+  add_kv KONG_HTTPS_PORT "8443"
+  add_kv ENABLE_ANONYMOUS_USERS "false"
+  add_kv STUDIO_DEFAULT_ORGANIZATION "Default Organization"
+  add_kv STUDIO_DEFAULT_PROJECT "Default Project"
+  add_kv LOGFLARE_PUBLIC_ACCESS_TOKEN "$(gen_secret)"
+  add_kv LOGFLARE_PRIVATE_ACCESS_TOKEN "$(gen_secret)"
+  add_kv POOLER_PROXY_PORT_TRANSACTION "6543"
+  add_kv POOLER_TENANT_ID "default"
+  add_kv POOLER_DEFAULT_POOL_SIZE "20"
+  add_kv POOLER_MAX_CLIENT_CONN "100"
+  add_kv POOLER_DB_POOL_SIZE "20"
 fi
-
 
 # ---------- Единый запуск (один проект) ----------
 # Проверка на наличие основного файла Supabase
@@ -410,24 +434,10 @@ if [ ! -f "$SUPABASE_DOCKER_DIR/docker-compose.yml" ]; then
 fi
 
 # Останавливаем старые остатки одного и того же проекта (если были)
-docker compose \
-  -f "$SUPABASE_DOCKER_DIR/docker-compose.yml" \
-  -f "$BASE_COMPOSE" \
-  -f "$SUPA_TRAEFIK_OVERRIDE" \
-  --project-name "$PROJECT_NAME" down --remove-orphans || true
-
+compose_down
 # Тянем образы и стартуем ВСЁ одной командой и одним project-name
-docker compose \
-  -f "$SUPABASE_DOCKER_DIR/docker-compose.yml" \
-  -f "$BASE_COMPOSE" \
-  -f "$SUPA_TRAEFIK_OVERRIDE" \
-  --project-name "$PROJECT_NAME" pull
-
-docker compose \
-  -f "$SUPABASE_DOCKER_DIR/docker-compose.yml" \
-  -f "$BASE_COMPOSE" \
-  -f "$SUPA_TRAEFIK_OVERRIDE" \
-  --project-name "$PROJECT_NAME" up -d --build
+compose_pull
+compose_up
 
 # ---------- Автопроверка HTTPS/issuer ----------
 set +e
