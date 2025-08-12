@@ -303,52 +303,104 @@ EOF
 # ---------- Supabase .env (если нет) ----------
 SUP_ENV_FILE="$SUPABASE_DOCKER_DIR/.env"
 mkdir -p "$SUPABASE_DOCKER_DIR"
+
 gen_secret(){ openssl rand -base64 48 | tr -d '\n'; }
 gen_hex(){ openssl rand -hex 32; }
 
 if [[ ! -f "$SUP_ENV_FILE" ]]; then
   msg "🔐 Генерирую .env для Supabase…"
   cat > "$SUP_ENV_FILE" <<EOF
+# --- Core Postgres ---
 POSTGRES_PASSWORD=$(gen_hex)
 POSTGRES_USER=postgres
 POSTGRES_DB=postgres
 POSTGRES_HOST=db
 POSTGRES_PORT=5432
+
+# --- URLs ---
+SITE_URL=https://$SUPABASE_DOMAIN
+SUPABASE_PUBLIC_URL=https://$SUPABASE_DOMAIN
+API_EXTERNAL_URL=https://$SUPABASE_DOMAIN
+ADDITIONAL_REDIRECT_URLS=https://$N8N_DOMAIN
+
+# --- Auth / JWT ---
 JWT_SECRET=$(gen_secret)
 JWT_EXPIRY=3600
 ANON_KEY=$(gen_secret)
 SERVICE_ROLE_KEY=$(gen_secret)
+ENABLE_EMAIL_SIGNUP=true
+ENABLE_ANONYMOUS_USERS=false
+ENABLE_PHONE_SIGNUP=false
+ENABLE_PHONE_AUTOCONFIRM=false
+ENABLE_EMAIL_AUTOCONFIRM=false
+DISABLE_SIGNUP=false
+
+# --- Mailer paths ---
+MAILER_URLPATHS_CONFIRMATION=/auth/confirm
+MAILER_URLPATHS_RECOVERY=/auth/recover
+MAILER_URLPATHS_INVITE=/auth/invite
+MAILER_URLPATHS_EMAIL_CHANGE=/auth/change
+
+# --- Kong ports (требуются compose-файлом) ---
+KONG_HTTP_PORT=8000
+KONG_HTTPS_PORT=8443
+
+# --- Studio defaults (можно поменять позже в UI) ---
+STUDIO_DEFAULT_ORGANIZATION=Default Organization
+STUDIO_DEFAULT_PROJECT=Default Project
+
+# --- Misc keys ---
 VAULT_ENC_KEY=$(gen_secret)
+LOGFLARE_PUBLIC_ACCESS_TOKEN=$(gen_secret)
+LOGFLARE_PRIVATE_ACCESS_TOKEN=$(gen_secret)
+
+# --- PostgREST ---
+PGRST_DB_SCHEMAS=public
+FUNCTIONS_VERIFY_JWT=true
+
+# --- Docker socket (важно для маунта, иначе будет :/var/run/docker.sock:ro,z) ---
+DOCKER_SOCKET_LOCATION=/var/run/docker.sock
+
+# --- Imgproxy ---
+IMGPROXY_ENABLE_WEBP_DETECTION=true
+
+# --- PgBouncer (pooler) ---
+POOLER_PROXY_PORT_TRANSACTION=6543
+POOLER_TENANT_ID=default
+POOLER_DEFAULT_POOL_SIZE=20
+POOLER_MAX_CLIENT_CONN=100
+POOLER_DB_POOL_SIZE=20
+
+# --- Dashboard (если используешь old dashboard) ---
 DASHBOARD_USERNAME=admin
 DASHBOARD_PASSWORD=$(gen_secret)
 SECRET_KEY_BASE=$(gen_secret)
+
+# --- SMTP (поставь реальные при отправке почты) ---
 SMTP_HOST=smtp.$DOMAIN_BASE
 SMTP_PORT=587
 SMTP_USER=no-reply@$DOMAIN_BASE
 SMTP_PASS=$(gen_secret)
 SMTP_ADMIN_EMAIL=admin@$DOMAIN_BASE
 SMTP_SENDER_NAME=Supabase
-SUPABASE_PUBLIC_URL=https://$SUPABASE_DOMAIN
-API_EXTERNAL_URL=https://$SUPABASE_DOMAIN
-ADDITIONAL_REDIRECT_URLS=https://$N8N_DOMAIN
-MAILER_URLPATHS_CONFIRMATION=/auth/confirm
-MAILER_URLPATHS_RECOVERY=/auth/recover
-MAILER_URLPATHS_INVITE=/auth/invite
-MAILER_URLPATHS_EMAIL_CHANGE=/auth/change
-ENABLE_EMAIL_SIGNUP=true
-ENABLE_ANONYМОUS_USERS=false
-ENABLE_PHONE_SIGNUP=false
-ENABLE_PHONE_AUTOCONFIRM=false
-ENABLE_EMAIL_AUTOCONFIRM=false
-DISABLE_SIGNUP=false
-PGRST_DB_SCHEMAS=public
-FUNCTIONS_VERIFY_JWT=true
-IMGPROXY_ENABLE_WEBP_DETECTION=true
 EOF
   chmod 600 "$SUP_ENV_FILE"
 else
-  msg "ℹ️ .env для Supabase уже есть."
+  msg "ℹ️ .env для Supabase уже существует — при необходимости дополни недостающие переменные."
+  # Минимальная гарантия, что критичные переменные присутствуют
+  grep -q '^DOCKER_SOCKET_LOCATION=' "$SUP_ENV_FILE" || echo "DOCKER_SOCKET_LOCATION=/var/run/docker.sock" >> "$SUP_ENV_FILE"
+  grep -q '^SITE_URL=' "$SUP_ENV_FILE" || echo "SITE_URL=https://$SUPABASE_DOMAIN" >> "$SUP_ENV_FILE"
+  grep -q '^KONG_HTTP_PORT=' "$SUP_ENV_FILE" || echo "KONG_HTTP_PORT=8000" >> "$SUP_ENV_FILE"
+  grep -q '^KONG_HTTPS_PORT=' "$SUP_ENV_FILE" || echo "KONG_HTTPS_PORT=8443" >> "$SUP_ENV_FILE"
+  grep -q '^POOLER_PROXY_PORT_TRANSACTION=' "$SUP_ENV_FILE" || cat >> "$SUP_ENV_FILE" <<'EOF'
+POOLER_PROXY_PORT_TRANSACTION=6543
+POOLER_TENANT_ID=default
+POOLER_DEFAULT_POOL_SIZE=20
+POOLER_MAX_CLIENT_CONN=100
+POOLER_DB_POOL_SIZE=20
+EOF
 fi
+
 
 # ---------- Единый запуск (один проект) ----------
 # Проверка на наличие основного файла Supabase
