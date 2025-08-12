@@ -155,12 +155,8 @@ echo "Создаю docker-compose.yml..."
 cat > "$PROJECT_DIR/docker-compose.yml" <<EOF
 version: "3.9"
 
-# --- ИСПРАВЛЕНИЕ ---
-# Определяем traefik-net как сеть по умолчанию для всех сервисов в этом файле.
-# Это гарантирует, что Traefik и другие сервисы находятся в одной сети.
 networks:
-  default:
-    name: traefik-net
+  traefik-net:
     external: true
 
 services:
@@ -169,6 +165,10 @@ services:
     command:
       - "--providers.docker=true"
       - "--providers.docker.exposedbydefault=false"
+      # --- КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ ---
+      # Явно указываем Traefik, какую сеть использовать для поиска контейнеров.
+      # Это решает проблему "unable to find the IP address".
+      - "--providers.docker.network=traefik-net"
       - "--log.level=INFO"
       - "--entrypoints.web.address=:80"
       - "--entrypoints.websecure.address=:443"
@@ -187,7 +187,8 @@ services:
       - "traefik.http.routers.traefik-dashboard.entrypoints=websecure"
       - "traefik.http.routers.traefik-dashboard.tls.certresolver=letsencrypt"
       - "traefik.http.routers.traefik-dashboard.service=api@internal"
-    # Ключ 'networks' здесь больше не нужен, т.к. используется сеть по умолчанию.
+    networks:
+      - traefik-net
     restart: unless-stopped
 
   site:
@@ -200,6 +201,8 @@ services:
       - "traefik.http.routers.site.entrypoints=websecure"
       - "traefik.http.routers.site.tls.certresolver=letsencrypt"
       - "traefik.http.services.site.loadbalancer.server.port=80"
+    networks:
+      - traefik-net
     restart: unless-stopped
 
   n8n:
@@ -221,6 +224,8 @@ services:
       - "traefik.http.routers.n8n.entrypoints=websecure"
       - "traefik.http.routers.n8n.tls.certresolver=letsencrypt"
       - "traefik.http.services.n8n.loadbalancer.server.port=5678"
+    networks:
+      - traefik-net
     restart: unless-stopped
 EOF
 
