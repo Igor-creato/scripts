@@ -6,9 +6,9 @@ set -euo pipefail
 # Traefik (Let's Encrypt) + сайт (nginx) + n8n + Supabase (self-hosted)
 #
 # Режимы:
-#   1) bash install.sh          -> STAGING (тестовые сертификаты, без лимитов)
+#   1) bash install.sh          -> STAGING (тестовые сертификаты)
 #   2) bash install.sh --prod   -> PROD (боевые сертификаты)
-#   3) bash install.sh --update -> Обновление образов/контейнеров, без изменения конфигов/сертов
+#   3) bash install.sh --update -> Обновление образов/контейнеров
 #
 
 # ---------- ПАРАМЕТРЫ ----------
@@ -40,12 +40,10 @@ msg() { echo -e "$*"; }
 
 wait_https_ready() {
   local domain="$1"
-  local tries="${2:-60}"   # до 60 попыток
-  local sleep_s="${3:-5}"  # по 5 секунд между попытками
-
+  local tries="${2:-60}"
+  local sleep_s="${3:-5}"
   msg "⏳ Жду доступности https://${domain} ..."
   for ((i=1; i<=tries; i++)); do
-    # Не валим на самоподписанном/стейджинг сертификате (-k)
     if curl -k -sS -o /dev/null -w "%{http_code}" "https://${domain}" | grep -Eq '^(200|301|302|401|403)$'; then
       msg "✅ HTTP(S) доступен на https://${domain}"
       return 0
@@ -61,16 +59,12 @@ check_cert_issuer() {
   local expect_staging="$2" # "yes"|"no"
   local issuer
   issuer=$(openssl s_client -connect "${domain}:443" -servername "${domain}" -showcerts </dev/null 2>/dev/null | openssl x509 -noout -issuer 2>/dev/null || true)
-
   if [[ -z "$issuer" ]]; then
     msg "⚠️  Не удалось прочитать сертификат для ${domain}"
     return 1
   fi
-
   msg "🔎 Issuer для ${domain}: ${issuer}"
-
   if [[ "$expect_staging" == "yes" ]]; then
-    # У staging Let's Encrypt обычно CN содержит "Fake LE Intermediate"
     if echo "$issuer" | grep -qi "Fake LE"; then
       msg "✅ Найден STAGING сертификат (issuer содержит 'Fake LE')."
       return 0
@@ -79,7 +73,6 @@ check_cert_issuer() {
       return 1
     fi
   else
-    # Для прод — ожидаем, что это Let's Encrypt, но не 'Fake LE'
     if echo "$issuer" | grep -qi "Let's Encrypt" && ! echo "$issuer" | grep -qi "Fake LE"; then
       msg "✅ Найден PROD сертификат от Let's Encrypt."
       return 0
@@ -93,7 +86,6 @@ check_cert_issuer() {
 # ---------- РЕЖИМ ОБНОВЛЕНИЯ ----------
 if [[ "$MODE" == "update" ]]; then
   msg "🔄 Режим обновления..."
-
   if ! docker network ls --format '{{.Name}}' | grep -q "^traefik-net$"; then
     msg "❌ Сеть traefik-net не найдена — выполните полную установку."
     exit 1
@@ -102,6 +94,9 @@ if [[ "$MODE" == "update" ]]; then
     msg "❌ Проект не найден — выполните полную установку."
     exit 1
   fi
+  # Чистим возможных «сирот»
+  (cd "$PROJECT_DIR" && docker compose down --remove-orphans || true)
+  (cd "$SUPABASE_DOCKER_DIR" && docker compose down --remove-orphans || true)
 
   msg "📦 Обновляю Traefik, сайт и n8n..."
   cd "$PROJECT_DIR"
@@ -177,7 +172,7 @@ else
 fi
 STORAGE_PATH="/letsencrypt/${ACME_FILE}"
 
-# ---------- СОЗДАНИЕ КОНФИГА TRAEFIK ----------
+# ---------- КОНФИГ TRAEFIK ----------
 msg "Создаю конфигурацию Traefik..."
 cat > "$TRAEFIK_DIR/traefik.yml" <<EOF
 api:
@@ -200,7 +195,7 @@ $CASERVER_LINE
         entryPoint: web
 EOF
 
-# ---------- СОХРАНЕНИЕ ACME-ФАЙЛА ----------
+# ---------- ACME-ФАЙЛ ----------
 if [ ! -f "$LE_DIR/$ACME_FILE" ]; then
   msg "Создаю $LE_DIR/$ACME_FILE ..."
   touch "$LE_DIR/$ACME_FILE"
@@ -209,7 +204,7 @@ else
   msg "Использую существующий $LE_DIR/$ACME_FILE (сертификаты не будут пересозданы)."
 fi
 
-# ---------- СОЗДАНИЕ СЕТИ TRAEFIK-NET ----------
+# ---------- СЕТЬ ----------
 if ! docker network ls --format '{{.Name}}' | grep -q "^traefik-net$"; then
   msg "Создаю сеть traefik-net..."
   docker network create traefik-net
@@ -217,10 +212,10 @@ else
   msg "Сеть traefik-net уже существует."
 fi
 
-# ---------- DOCKER-COMPOSE (Traefik + Site + n8n + Dashboard) ----------
+# ---------- COMPOSE: Traefik + Site + n8n ----------
 msg "Создаю docker-compose.yml..."
 cat > "$PROJECT_DIR/docker-compose.yml" <<EOF
-version: "3.9"
+name: project
 networks:
   traefik-net:
     external: true
@@ -247,6 +242,7 @@ services:
       - "traefik.http.routers.traefik-dashboard.entrypoints=websecure"
       - "traefik.http.routers.traefik-dashboard.tls.certresolver=letsencrypt"
       - "traefik.http.routers.traefik-dashboard.service=api@internal"
+      - "traefik.docker.network=traefik-net"
     networks:
       - traefik-net
     restart: unless-stopped
@@ -261,6 +257,7 @@ services:
       - "traefik.http.routers.site.entrypoints=websecure"
       - "traefik.http.routers.site.tls.certresolver=letsencrypt"
       - "traefik.http.services.site.loadbalancer.server.port=80"
+      - "traefik.docker.network=traefik-net"
     networks:
       - traefik-net
     restart: unless-stopped
@@ -284,12 +281,13 @@ services:
       - "traefik.http.routers.n8n.entrypoints=websecure"
       - "traefik.http.routers.n8n.tls.certresolver=letsencrypt"
       - "traefik.http.services.n8n.loadbalancer.server.port=5678"
+      - "traefik.docker.network=traefik-net"
     networks:
       - traefik-net
     restart: unless-stopped
 EOF
 
-# ---------- ПРОСТОЙ САЙТ ----------
+# ---------- САЙТ ----------
 mkdir -p "$PROJECT_DIR/site"
 cat > "$PROJECT_DIR/site/Dockerfile" <<'EOF'
 FROM nginx:stable-alpine
@@ -353,7 +351,7 @@ ENABLE_EMAIL_SIGNUP=true
 ENABLE_ANONYMOUS_USERS=false
 ENABLE_PHONE_SIGNUP=false
 ENABLE_PHONE_AUTOCONFIRM=false
-ENABLE_EMAIL_AUTOCONФIRM=false
+ENABLE_EMAIL_AUTOCONFIRM=false
 DISABLE_SIGNUP=false
 PGRST_DB_SCHEMAS=public
 FUNCTIONS_VERIFY_JWT=true
@@ -370,9 +368,9 @@ else
   msg ".env для Supabase уже существует."
 fi
 
-# ---------- OVERRIDE ДЛЯ SUPABASE ----------
+# ---------- OVERRIDE ДЛЯ SUPABASE (Kong + Studio под Traefik) ----------
 cat > "$SUPABASE_DOCKER_DIR/docker-compose.override.yml" <<EOF
-version: "3.9"
+name: project-supabase
 networks:
   traefik-net:
     external: true
@@ -386,6 +384,7 @@ services:
       - "traefik.http.routers.supabase.entrypoints=websecure"
       - "traefik.http.routers.supabase.tls.certresolver=letsencrypt"
       - "traefik.http.services.supabase.loadbalancer.server.port=8000"
+      - "traefik.docker.network=traefik-net"
   studio:
     networks:
       - traefik-net
@@ -395,28 +394,35 @@ services:
       - "traefik.http.routers.supabase-studio.entrypoints=websecure"
       - "traefik.http.routers.supabase-studio.tls.certresolver=letsencrypt"
       - "traefik.http.services.supabase-studio.loadbalancer.server.port=3000"
+      - "traefik.docker.network=traefik-net"
 EOF
 
-# ---------- ЗАПУСК TRAEFIK + SITE + N8N ----------
+# ---------- Чистим возможные старые проекты и поднимаем стек ----------
+(cd "$PROJECT_DIR" && docker compose down --remove-orphans || true)
+(cd "$SUPABASE_DOCKER_DIR" && docker compose down --remove-orphans || true)
+
+# Traefik + Site + n8n
 cd "$PROJECT_DIR"
 docker compose pull
 docker compose up -d --build
 
-# ---------- ЗАПУСК SUPABASE ----------
+# Supabase
 cd "$SUPABASE_DOCKER_DIR"
 docker compose pull
 docker compose up -d
 
-# ---------- АВТОПРОВЕРКА HTTPS И ИЗДАТЕЛЯ СЕРТА ----------
+# ---------- АВТОПРОВЕРКА HTTPS / ISSUER ----------
 set +e
 overall_ok=0
+EXPECT_STAGING="yes"
+[[ "$MODE" == "prod" ]] && EXPECT_STAGING="no"
 
 for d in "$SITE_DOMAIN" "$N8N_DOMAIN" "$TRAEFIK_DOMAIN"; do
   if wait_https_ready "$d" 60 5; then
     if check_cert_issuer "$d" "$EXPECT_STAGING"; then
       msg "✅ Проверка ${d} прошла успешно."
     else
-      msg "⚠️  ${d}: HTTPS доступен, но издатель сертификата не совпал с ожидаемым режимом."
+      msg "⚠️  ${d}: HTTPS доступен, но issuer не совпал с ожидаемым режимом."
       overall_ok=1
     fi
   else
@@ -430,22 +436,14 @@ echo
 if [[ "$MODE" == "staging" ]]; then
   echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
   echo "🧪 УСТАНОВКА ЗАВЕРШЕНА В РЕЖИМЕ STAGING"
-  echo "Файлы сертификатов: $LE_DIR/acme-staging.json"
-  echo "Когда всё проверишь — переключайся на боевые сертификаты командой:"
-  echo
-  echo "  bash \"$0\" --prod"
-  echo
-  echo "Это перегенерирует traefik.yml на продовый CA,"
-  echo "смонтирует $LE_DIR/acme.json внутрь контейнера,"
-  echo "и перезапустит сервисы без простоя."
+  echo "Файл сертификатов: $LE_DIR/acme-staging.json"
+  echo "Переключиться на прод:  bash \"$0\" --prod"
   echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 else
   echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
   echo "✅ УСТАНОВКА ЗАВЕРШЕНА В РЕЖИМЕ PROD"
-  echo "Файлы сертификатов: $LE_DIR/acme.json"
-  echo "Для обновления образов в будущем используйте:"
-  echo
-  echo "  bash \"$0\" --update"
+  echo "Файл сертификатов: $LE_DIR/acme.json"
+  echo "Обновление в будущем:  bash \"$0\" --update"
   echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 fi
 
