@@ -154,9 +154,15 @@ fi
 echo "Создаю docker-compose.yml..."
 cat > "$PROJECT_DIR/docker-compose.yml" <<EOF
 version: "3.9"
+
+# --- ИСПРАВЛЕНИЕ ---
+# Определяем traefik-net как сеть по умолчанию для всех сервисов в этом файле.
+# Это гарантирует, что Traefik и другие сервисы находятся в одной сети.
 networks:
-  traefik-net:
+  default:
+    name: traefik-net
     external: true
+
 services:
   traefik:
     image: traefik:v3.1
@@ -181,8 +187,7 @@ services:
       - "traefik.http.routers.traefik-dashboard.entrypoints=websecure"
       - "traefik.http.routers.traefik-dashboard.tls.certresolver=letsencrypt"
       - "traefik.http.routers.traefik-dashboard.service=api@internal"
-    networks:
-      - traefik-net
+    # Ключ 'networks' здесь больше не нужен, т.к. используется сеть по умолчанию.
     restart: unless-stopped
 
   site:
@@ -195,8 +200,6 @@ services:
       - "traefik.http.routers.site.entrypoints=websecure"
       - "traefik.http.routers.site.tls.certresolver=letsencrypt"
       - "traefik.http.services.site.loadbalancer.server.port=80"
-    networks:
-      - traefik-net
     restart: unless-stopped
 
   n8n:
@@ -218,8 +221,6 @@ services:
       - "traefik.http.routers.n8n.entrypoints=websecure"
       - "traefik.http.routers.n8n.tls.certresolver=letsencrypt"
       - "traefik.http.services.n8n.loadbalancer.server.port=5678"
-    networks:
-      - traefik-net
     restart: unless-stopped
 EOF
 
